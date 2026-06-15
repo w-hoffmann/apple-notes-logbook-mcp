@@ -1,0 +1,64 @@
+[project]
+name = "apple-notes-logbook-mcp"
+version = "0.1.0"
+description = "Local macOS MCP server that appends to and reads back an Apple Notes 'Logbook' folder."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+authors = [{ name = "W. Hoffmann", email = "office@w-hoffmann.com" }]
+keywords = ["mcp", "apple-notes", "logbook", "macos"]
+classifiers = [
+    "Private :: Do Not Upload",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    # Official MCP Python SDK. We use the low-level `mcp.server.lowlevel.Server`
+    # (NOT FastMCP) for exact control of the tool schemas. Pinned to the 1.x
+    # line; Dependabot bumps within range. See design D1/D4.
+    "mcp>=1.27.2,<2",
+]
+
+[project.scripts]
+apple-notes-logbook-mcp = "apple_notes_logbook_mcp.server:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pyright>=1.1.390",
+    "ruff>=0.8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/apple_notes_logbook_mcp"]
+
+# ---------------------------------------------------------------------------
+# Tooling (configured-as-code, see design D9)
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# A pragmatic, low-noise rule set: pyflakes, pycodestyle, isort, bugbear,
+# comprehensions, pyupgrade, simplify.
+select = ["E", "F", "I", "B", "C4", "UP", "SIM"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
+reportMissingTypeStubs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
