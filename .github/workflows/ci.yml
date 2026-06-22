@@ -15,7 +15,7 @@ jobs:
     # platform-specific code paths there. Tests are pure (no live Notes).
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
