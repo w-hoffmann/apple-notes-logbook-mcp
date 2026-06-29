@@ -16,7 +16,7 @@ dependencies = [
     # Official MCP Python SDK. We use the low-level `mcp.server.lowlevel.Server`
     # (NOT FastMCP) for exact control of the tool schemas. Pinned to the 1.x
     # line; Dependabot bumps within range. See design D1/D4.
-    "mcp>=1.27.2,<2",
+    "mcp>=1.28.1,<2",
 ]
 
 [project.scripts]
