@@ -30,6 +30,35 @@ behavior contradicts an assumption here.
 - Recovery: `tccutil reset AppleEvents` (all) resets the grant so the prompt
   reappears. Scope to a bundle id once known.
 
+### Apple Events error numbers ✅ (web research, 2026-07-07)
+
+| Number | Meaning | Server mapping |
+| --- | --- | --- |
+| `-1743` | `errAEEventNotPermitted` — Automation denied/not yet granted | `PermissionDeniedError` |
+| `-1728` | no such object — the specific property (e.g. `creation date`) couldn't be read | per-note/per-create fallback to `modification date` (not an abort) |
+| `-600` | `procNotFound` — the target app isn't running / can't be reached | `NotesUnavailableError` |
+| `-609` | connection to the application is invalid (Notes quit mid-operation) | `NotesUnavailableError` (same remedy as `-600`) |
+| `-1712` | Apple Event timed out | `OperationTimeoutError` |
+
+- **`-10004` is *not* the TCC-denial signal.** It is a Standard-Suite privilege
+  error (a different failure class); do not treat it as equivalent to `-1743`
+  when classifying stderr.
+- **A denied Automation grant is never a silent success.** `-1743` always
+  raises (non-zero exit + stderr); the only ways `osascript` can exit 0 with
+  "nothing happened" are a bare `try` that swallows the error or `ignoring
+  application responses` — neither is used anywhere in this server's scripts,
+  so a denied grant cannot masquerade as `{ "created": true }`.
+- **No pre-flight permission probe.** `AEDeterminePermissionToAutomateTarget`
+  (`askUserIfNeeded=false`) cannot distinguish "denied" from "undecided" —
+  both return `-1744` — and has a documented hang bug. It would also need a
+  PyObjC/C bridge for no reliable gain. Decision: keep attempt-and-classify
+  (run the operation, classify the failure) rather than probing first.
+- **Classification is number-first, substring-fallback-second.** Error numbers
+  are locale-independent (this deployment runs a German locale); a text
+  substring (`"not authorized to send apple events"`, case-insensitive) is
+  only consulted when no `(-NNNN)` could be parsed at all, to catch an
+  unexpected stderr shape without becoming the primary signal.
+
 ## 2. The log folder is a hard prerequisite ✅
 
 - The folder name is **configurable**: env `LOGBOOK_FOLDER`, default **`Logbook`**.
@@ -40,6 +69,19 @@ behavior contradicts an assumption here.
 - The server selects the **iCloud account explicitly** (`account "iCloud"`,
   falling back to the sole account) so a same-named folder in another account
   (e.g. "On My Mac") is not touched.
+- **Self-diagnosing folder-missing message ✅.** On the missing-folder branch,
+  the same Apple Event (create or read) also enumerates `name of every folder`
+  of the target account and raises the list alongside the marker, FS-joined.
+  `_classify` strips osascript's `execution error: … (-NNNN).` wrapper before
+  splitting on FS (the FS control character itself survives to stderr intact —
+  confirmed on this machine; the gotcha is the trailing `(-NNNN)` glued onto
+  the *last* folder name, which must be stripped first). Rendered message:
+  `Folder 'Logbuch' not found in the iCloud account. Existing folders: 'Claude
+  Logbuch', 'Notizen'. Check LOGBOOK_FOLDER (or rename the folder) and try
+  again.` (or "No folders were found in the iCloud account." when empty). This
+  costs nothing on the happy path — enumeration only runs once already
+  failing — and if Automation is denied, the enumeration itself raises
+  `-1743` first, so the permission error still wins.
 
 ## 3. Why `osascript` (and not the alternatives) ✅ (decision)
 
@@ -64,6 +106,34 @@ behavior contradicts an assumption here.
   date` **inside the loop**, so one bad note degrades only that entry — the whole
   read never fails for it. (`properties of every note` would fail the whole record
   at once, so it is deliberately not used.)
+- **Write path: create-then-confirm, same guard ✅.** `append_log_entry`'s
+  AppleScript binds the just-created note and reads its date back **in the
+  same Apple Event**, guarded exactly like the read loop: `try` creation date →
+  `on error try` modification date → `""` if both fail. The returned `date` is
+  therefore always a value read from Notes — **never the server's own clock**
+  — so it is the same value `read_log` will later emit for that note, and it
+  doubles as existence proof: an empty/malformed read-back is treated as
+  failure (`isError`) even if the underlying process exited 0, closing the
+  last silent-write path.
+- **At-least-once, not exactly-once ✅ (accepted trade-off).** `make new note`
+  can, in principle, create the note and then have the operation time out
+  before the date read-back returns (AppleScript's own `with timeout`, or the
+  subprocess-kill backstop) — this one ambiguity cannot be closed in-script.
+  `create_note` re-raises exactly that case as `AmbiguousCreateError` (never
+  the generic `OperationTimeoutError`), whose message notes the entry may or
+  may not have been created and that the server does **not auto-retry** — a
+  blind retry is what would create a duplicate. Every *other* create failure
+  (folder-missing, permission denied, Notes unavailable) is established
+  before any Apple Event that could have created the note, so it propagates
+  unchanged, with no ambiguity wording. `read_notes` never creates anything,
+  so its timeout stays the plain `OperationTimeoutError` too. Dedup is
+  deliberately out of scope — a rare visible duplicate is benign for an
+  append-only logbook; a lost entry is not.
+- **Exact `-1743` stderr form (observed):** `execution error: Not authorised to
+  send Apple events (-1743).` — the trailing `(-NNNN).` is what
+  `_parse_folder_list`/`_TRAILING_AE_CODE_RE` strip when parsing the
+  folder-missing payload; classification itself keys on the number via
+  `_extract_ae_number`, not this exact string.
 
 ## 5. `name` vs. the first body line ✅
 
@@ -109,9 +179,13 @@ behavior contradicts an assumption here.
 
 - Every Notes op runs under an AppleScript `with timeout` set **below**
   AppleScript's 120 s default, and the Python subprocess is killed a few seconds
-  later as a hard backstop (write/folder ≈ 30 s AS / 35 s kill; read ≈ 110 s AS /
+  later as a hard backstop (write ≈ 30 s AS / 35 s kill; read ≈ 110 s AS /
   115 s kill). A stuck Notes app or a pending permission dialog surfaces as a
   timeout error (`-1712` / subprocess kill), not an indefinite block.
+- There is no separate `folder_exists` operation (removed as dead weight):
+  the missing-folder check is inline in the create/read script itself, so
+  folder-missing detection shares the same op's timeout rather than paying
+  for a second Apple Event.
 
 ## 9. Binary / config paths ✅
 
@@ -141,3 +215,14 @@ behavior contradicts an assumption here.
    calendar date.
 6. Confirm append-only: existing notes untouched; `read_log` does not bump any
    `modificationDate`; empty folder → `count` 0.
+7. `tccutil reset AppleEvents`, then **deny** the prompt: both
+   `append_log_entry` and `read_log` return the `-1743` actionable message
+   (no silent success, no empty result) — re-approve afterward to continue.
+8. Rename the `Logbuch` folder (or point `LOGBOOK_FOLDER` at a name that
+   doesn't exist): both tools return `Folder '…' not found` listing the
+   folders that *do* exist in the account.
+9. `append_log_entry` returns `{ "created": true, "date": "YYYY-MM-DD" }`
+   matching the new note's creation date in Notes.
+10. `read_log` with `prefix="TECH:"` returns only matching entries (exact,
+    case-sensitive); `read_log` with `include_detail=false` returns dated
+    headings only, same `count` as with detail included.

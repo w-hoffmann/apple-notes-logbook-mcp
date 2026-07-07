@@ -16,7 +16,10 @@ import pytest
 from apple_notes_logbook_mcp.core import RawNote
 from apple_notes_logbook_mcp.notes import (
     FOLDER_NAME,
+    AmbiguousCreateError,
     FakeNotesProvider,
+    FolderNotFoundError,
+    NotesError,
     NotesUnavailableError,
     OperationTimeoutError,
     PermissionDeniedError,
@@ -98,13 +101,27 @@ def test_both_tools_declare_output_schema():
 
 
 def test_append_success_minimal_structured_content():
-    provider = FakeNotesProvider()
+    provider = FakeNotesProvider(clock=_fixed_clock)
     res = _call(provider, "append_log_entry", {"summary": "Hello"})
     assert res.isError is False
-    assert res.structuredContent == {"created": True}
+    assert res.structuredContent == {"created": True, "date": "2026-06-15"}
     # JSON text block mirrors the structured content; no id/title echoed.
-    assert json.loads(_text(res)) == {"created": True}
+    assert json.loads(_text(res)) == {"created": True, "date": "2026-06-15"}
     assert provider.created_bodies == ["<div>Hello</div>"]
+
+
+def test_append_date_comes_from_the_note_not_the_server_clock():
+    # do_append must not substitute its own "today" for the provider's
+    # returned date. Use a provider clock far from the server's fixed clock
+    # (FIXED_NOW = 2026-06-15) so a silent always-fallback-to-server-clock
+    # regression would be caught.
+    def other_clock() -> datetime:
+        return datetime(2020, 1, 1, tzinfo=UTC)
+
+    provider = FakeNotesProvider(clock=other_clock)
+    res = _call(provider, "append_log_entry", {"summary": "Hello"})
+    assert res.isError is False
+    assert res.structuredContent == {"created": True, "date": "2020-01-01"}
 
 
 def test_append_with_detail_assembles_body():
@@ -154,6 +171,45 @@ def test_read_missing_folder_aborts():
     provider = FakeNotesProvider(folder_present=False)
     res = _call(provider, "read_log", {})
     _assert_error(res, contains=f"Folder '{FOLDER_NAME}' not found")
+
+
+def test_append_missing_folder_lists_existing_folders():
+    provider = FakeNotesProvider(
+        raise_on=FolderNotFoundError(existing=["Claude Logbuch", "Notizen"])
+    )
+    res = _call(provider, "append_log_entry", {"summary": "x"})
+    _assert_error(res, contains="'Claude Logbuch'")
+    assert "'Notizen'" in _text(res)
+
+
+def test_read_missing_folder_lists_existing_folders():
+    provider = FakeNotesProvider(
+        raise_on=FolderNotFoundError(existing=["Claude Logbuch", "Notizen"])
+    )
+    res = _call(provider, "read_log", {})
+    _assert_error(res, contains="'Claude Logbuch'")
+    assert "'Notizen'" in _text(res)
+
+
+def test_append_unconfirmed_creation_is_an_error():
+    # Spec scenario "Unconfirmed creation is surfaced as an error": neither
+    # date could be read back even though the process reported success.
+    provider = FakeNotesProvider(
+        raise_on=NotesError(
+            "Notes did not confirm the new note: neither its creation date nor its "
+            "modification date could be read back."
+        )
+    )
+    res = _call(provider, "append_log_entry", {"summary": "x"})
+    _assert_error(res, contains="did not confirm the new note")
+
+
+def test_append_ambiguous_create_failure_is_an_error():
+    # Spec scenario "Ambiguous failure after a note may already exist".
+    provider = FakeNotesProvider(raise_on=AmbiguousCreateError())
+    res = _call(provider, "append_log_entry", {"summary": "x"})
+    _assert_error(res, contains="may or may not")
+    assert "does not automatically retry" in _text(res)
 
 
 def test_permission_denied_is_actionable():
@@ -238,6 +294,23 @@ def test_stdout_stays_clean_during_tool_calls(capsys):
     _call(provider, "append_log_entry", {"summary": "x"})
     _call(provider, "read_log", {})
     assert capsys.readouterr().out == ""
+
+
+def test_read_log_prefix_and_include_detail_through_tools():
+    provider = FakeNotesProvider(clock=_fixed_clock)
+    _call(provider, "append_log_entry", {"summary": "TECH: refactor", "detail": "why"})
+    _call(provider, "append_log_entry", {"summary": "Other entry", "detail": "why not"})
+
+    prefixed = _call(provider, "read_log", {"prefix": "TECH:"})
+    assert prefixed.structuredContent is not None
+    assert prefixed.structuredContent["count"] == 1
+    assert prefixed.structuredContent["entries_text"] == "2026-06-15 — TECH: refactor\n\nwhy"
+
+    headings_only = _call(provider, "read_log", {"include_detail": False})
+    assert headings_only.structuredContent is not None
+    assert headings_only.structuredContent["count"] == 2
+    assert "why" not in headings_only.structuredContent["entries_text"]
+    assert "why not" not in headings_only.structuredContent["entries_text"]
 
 
 def test_round_trip_special_chars_and_filter_through_tools():

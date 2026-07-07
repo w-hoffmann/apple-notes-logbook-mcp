@@ -20,8 +20,8 @@ It exposes exactly **two tools**:
 
 | Tool | What it does |
 | --- | --- |
-| `append_log_entry` | Creates **one new note** in the `Logbook` folder. `summary` is the note's first line; optional `detail` is the body below it. Append-only — never edits or deletes existing notes. |
-| `read_log` | Reads every note in the folder and returns them consolidated into one chronological, dated text block. Optional `from`/`to` (ISO `YYYY-MM-DD`) filter inclusively by each note's creation date in your local time zone (`to` defaults to today). |
+| `append_log_entry` | Creates **one new note** in the `Logbook` folder. `summary` is the note's first line; optional `detail` is the body below it. Append-only — never edits or deletes existing notes. Reads the new note back in the same operation and returns `{ "created": true, "date": "YYYY-MM-DD" }` — the note's own creation date, confirming it actually persisted. |
+| `read_log` | Reads every note in the folder and returns them consolidated into one chronological, dated text block. Optional `from`/`to` (ISO `YYYY-MM-DD`) filter inclusively by each note's creation date in your local time zone (`to` defaults to today). Optional `prefix` returns only entries whose first line starts with that exact, case-sensitive string (e.g. `TECH:`) — the server has no built-in taxonomy. Optional `include_detail` (default `true`); set `false` to return dated headings only, omitting body lines. |
 
 By design there is **no** update/delete/edit tool, **no** automatic folder
 creation, and **no** external list/search.
@@ -112,10 +112,15 @@ remediation:
 
 | Symptom | Apple Events error | What to do |
 | --- | --- | --- |
-| "Not authorised to control Apple Notes" | `-1743` | Grant Automation → Notes for the controlling app; or `tccutil reset AppleEvents`. |
-| "Apple Notes could not be reached" | `-600` | Make sure Notes is installed and can launch. |
+| "Not authorised to control Apple Notes" | `-1743` (or unparseable stderr containing "not authorized to send apple events") | Grant Automation → Notes for the controlling app; or `tccutil reset AppleEvents`. |
+| "Apple Notes could not be reached" | `-600` (not running) or `-609` (connection invalid) | Make sure Notes is installed and can launch. |
 | "The Notes operation timed out" | `-1712` / subprocess kill | Approve any pending permission dialog; very large folders can also time out. |
-| "Folder 'Logbook' not found" | — | Create the `Logbook` folder in the iCloud account. |
+| "Folder 'Logbook' not found" | — | The message also lists the folders that *do* exist in the iCloud account (or says none were found), so a rename/typo is diagnosable without opening Notes. Fix `LOGBOOK_FOLDER` or rename the folder to match. |
+
+`append_log_entry` is **at-least-once**, not exactly-once: if the create operation fails
+after the note may already have been made (e.g. a timeout), the error message says so and
+the server does **not** automatically retry (to avoid a duplicate) — check the folder
+before retrying by hand.
 
 ## Development
 

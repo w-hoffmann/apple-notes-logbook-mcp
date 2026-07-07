@@ -213,6 +213,102 @@ def test_consolidate_timezone_boundary_filter_uses_local_date():
     assert result.entries_text == "2026-03-14 — edge"
 
 
+# --- read_log projection: prefix + include_detail (D-E) -------------------
+
+
+def _tech_notes() -> list[RawNote]:
+    return [
+        RawNote(
+            "a",
+            "<div>TECH: refactor</div><div><br></div><div>why</div>",
+            creation_date=datetime(2026, 3, 14, 9, 0),
+        ),
+        RawNote(
+            "b",
+            "<div>Other entry</div><div><br></div><div>why not</div>",
+            creation_date=datetime(2026, 3, 15, 9, 0),
+        ),
+        RawNote(
+            "c",
+            "<div>tech: lowercase, excluded</div>",
+            creation_date=datetime(2026, 3, 16, 9, 0),
+        ),
+    ]
+
+
+def test_consolidate_prefix_filters_by_first_plain_text_line():
+    result = consolidate(_tech_notes(), tz=UTC, today=TODAY, prefix="TECH:")
+    assert result.count == 1
+    assert result.entries_text == "2026-03-14 — TECH: refactor\n\nwhy"
+
+
+def test_consolidate_prefix_is_exact_and_case_sensitive():
+    # "tech: lowercase, excluded" must not match "TECH:" (case) and a prefix
+    # occurring later in the line (not anchored at the start) must not match.
+    notes = [
+        *_tech_notes(),
+        RawNote("d", "<div>see TECH: mid-line</div>", creation_date=datetime(2026, 3, 17, 9, 0)),
+    ]
+    result = consolidate(notes, tz=UTC, today=TODAY, prefix="TECH:")
+    assert result.count == 1
+    assert "lowercase" not in result.entries_text
+    assert "mid-line" not in result.entries_text
+
+
+def test_consolidate_prefix_composes_with_date_range():
+    notes = [
+        RawNote("a", "<div>TECH: in range</div>", creation_date=datetime(2026, 3, 14, 9, 0)),
+        RawNote("b", "<div>TECH: out of range</div>", creation_date=datetime(2026, 3, 20, 9, 0)),
+    ]
+    result = consolidate(
+        notes, tz=UTC, today=TODAY, frm=date(2026, 3, 14), to=date(2026, 3, 15), prefix="TECH:"
+    )
+    assert result.count == 1
+    assert "in range" in result.entries_text
+    assert "out of range" not in result.entries_text
+
+
+def test_consolidate_empty_prefix_imposes_no_filter():
+    result = consolidate(_tech_notes(), tz=UTC, today=TODAY, prefix="")
+    assert result.count == 3
+
+
+def test_consolidate_omitted_prefix_reproduces_prior_output():
+    with_prefix_omitted = consolidate(_tech_notes(), tz=UTC, today=TODAY)
+    with_prefix_none = consolidate(_tech_notes(), tz=UTC, today=TODAY, prefix=None)
+    assert with_prefix_omitted == with_prefix_none
+    assert with_prefix_omitted.count == 3
+
+
+def test_consolidate_include_detail_false_yields_headings_only():
+    result = consolidate(_tech_notes(), tz=UTC, today=TODAY, include_detail=False)
+    assert result.count == 3  # unaffected by include_detail
+    assert "why" not in result.entries_text
+    assert "why not" not in result.entries_text
+    assert result.entries_text == (
+        "2026-03-14 — TECH: refactor\n\n"
+        "2026-03-15 — Other entry\n\n"
+        "2026-03-16 — tech: lowercase, excluded"
+    )
+
+
+def test_consolidate_prefix_and_include_detail_compose():
+    result = consolidate(_tech_notes(), tz=UTC, today=TODAY, prefix="TECH:", include_detail=False)
+    assert result.count == 1
+    assert result.entries_text == "2026-03-14 — TECH: refactor"
+
+
+def test_consolidate_omitting_both_projection_params_matches_prior_behavior():
+    # Regression: the pre-existing signature/behavior is reproduced exactly.
+    notes = [
+        RawNote("a", "<div>Later</div>", creation_date=datetime(2026, 3, 21, 10, 0)),
+        RawNote("b", "<div>Earlier</div>", creation_date=datetime(2026, 3, 14, 9, 0)),
+    ]
+    result = consolidate(notes, tz=UTC, today=TODAY)
+    assert result.count == 2
+    assert result.entries_text == "2026-03-14 — Earlier\n\n2026-03-21 — Later"
+
+
 # --- 3.5 round-trip --------------------------------------------------------
 
 

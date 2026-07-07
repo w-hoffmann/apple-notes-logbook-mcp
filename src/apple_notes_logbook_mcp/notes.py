@@ -38,7 +38,16 @@ OSASCRIPT = "/usr/bin/osascript"
 # Apple Events error numbers we map to actionable messages (design D8 / spec).
 AE_PERMISSION_DENIED = -1743  # not authorised to send Apple Events (Automation)
 AE_NOTES_UNAVAILABLE = -600  # application isn't running / can't be reached
+AE_NOTES_CONNECTION_INVALID = -609  # connection to the application is invalid
 AE_TIMEOUT = -1712  # Apple Event timed out
+
+# Locale-independent numeric codes are checked first; this is only a drift
+# fallback for when the stderr shape doesn't carry a parseable `(-NNNN)` (D-B).
+_AUTOMATION_DENIED_RE = re.compile(r"not authorized to send apple events", re.IGNORECASE)
+
+# The trailing `execution error: ... (-NNNN).` wrapper osascript appends to a
+# raised error's message; stripped before splitting the folder-missing payload.
+_TRAILING_AE_CODE_RE = re.compile(r"\(-\d+\)\.?\s*$")
 
 # Marker the scripts raise when the folder is missing.
 _FOLDER_NOT_FOUND_MARKER = "LOGBOOK_FOLDER_NOT_FOUND"
@@ -67,10 +76,15 @@ class NotesError(Exception):
 
 
 class FolderNotFoundError(NotesError):
-    def __init__(self, folder: str = FOLDER_NAME) -> None:
+    def __init__(self, folder: str = FOLDER_NAME, existing: list[str] | None = None) -> None:
+        if existing:
+            listing = ", ".join(f"'{name}'" for name in existing)
+            existing_clause = f"Existing folders: {listing}."
+        else:
+            existing_clause = "No folders were found in the iCloud account."
         super().__init__(
-            f"Folder '{folder}' not found in the iCloud Notes account. "
-            f"Create a folder named '{folder}' in Apple Notes (iCloud) and try again."
+            f"Folder '{folder}' not found in the iCloud account. {existing_clause} "
+            "Check LOGBOOK_FOLDER (or rename the folder) and try again."
         )
 
 
@@ -101,6 +115,27 @@ class OperationTimeoutError(NotesError):
         )
 
 
+class AmbiguousCreateError(NotesError):
+    """Create timed out after ``make new note`` may already have run.
+
+    The one irreducible ambiguity in create-then-confirm (design D-A): a
+    timeout (AppleScript's own ``with timeout`` or the subprocess-kill
+    backstop) can fire after the note was made but before its date could be
+    read back. Posture is at-least-once: surface this distinctly (never as
+    the generic :class:`OperationTimeoutError`) and never auto-retry, since a
+    blind retry is what would create a duplicate.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "The Notes create operation timed out. The new entry may or may not have "
+            "already been created — Apple Notes does not confirm this reliably once "
+            "the operation has failed partway through. The server does not "
+            "automatically retry (to avoid creating a duplicate); check the folder "
+            "before retrying by hand."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Provider protocol
 # ---------------------------------------------------------------------------
@@ -110,12 +145,13 @@ class OperationTimeoutError(NotesError):
 class NotesProvider(Protocol):
     """The Notes operations the server depends on."""
 
-    def folder_exists(self) -> bool:
-        """Return whether the target folder exists in the iCloud account."""
-        ...
+    def create_note(self, body_html: str) -> str:
+        """Create one new note (body only) in the target folder.
 
-    def create_note(self, body_html: str) -> None:
-        """Create one new note (body only) in the target folder."""
+        Returns the note's own creation date (``YYYY-MM-DD``, read back from
+        Notes in the same operation) as the create-then-confirm guarantee: a
+        successful return always corresponds to a persisted, read-back note.
+        """
         ...
 
     def read_notes(self) -> list[RawNote]:
@@ -160,39 +196,40 @@ on isoDate(d)
 end isoDate
 """
 
-_FOLDER_EXISTS_SCRIPT = f"""
-on run argv
-    set folderName to item 1 of argv
-    with timeout of {_WRITE_AS_TIMEOUT} seconds
-        tell application "Notes"
-            tell (my targetAccount())
-                if (exists folder folderName) then
-                    return "1"
-                else
-                    return "0"
-                end if
-            end tell
-        end tell
-    end timeout
-end run
-{_HELPERS}
-"""
+# Missing-folder branch shared by _CREATE_SCRIPT/_READ_SCRIPT: enumerate the
+# account's existing folder names and raise them FS-joined alongside the
+# marker (D-D), so `_classify` can turn a dead end into a self-diagnosing
+# message. In-script, error-path only: zero cost on the happy path.
+_FOLDER_MISSING_BRANCH = f"""
+                if not (exists folder folderName) then
+                    set folderNames to name of every folder
+                    set AppleScript's text item delimiters to FS
+                    set folderList to folderNames as string
+                    set AppleScript's text item delimiters to ""
+                    error "{_FOLDER_NOT_FOUND_MARKER}" & FS & folderList
+                end if"""
 
 _CREATE_SCRIPT = f"""
 on run argv
     set folderName to item 1 of argv
     set bodyHtml to item 2 of argv
+    set FS to (ASCII character 31)
+    set d to ""
     with timeout of {_WRITE_AS_TIMEOUT} seconds
         tell application "Notes"
-            tell (my targetAccount())
-                if not (exists folder folderName) then
-                    error "{_FOLDER_NOT_FOUND_MARKER}"
-                end if
-                make new note at folder folderName with properties {{body:bodyHtml}}
+            tell (my targetAccount()){_FOLDER_MISSING_BRANCH}
+                set newNote to make new note at folder folderName with properties {{body:bodyHtml}}
+                try
+                    set d to my isoDate(creation date of newNote)
+                on error
+                    try
+                        set d to my isoDate(modification date of newNote)
+                    end try
+                end try
             end tell
         end tell
     end timeout
-    return "OK"
+    return d
 end run
 {_HELPERS}
 """
@@ -209,10 +246,7 @@ on run argv
     set out to ""
     with timeout of {_READ_AS_TIMEOUT} seconds
         tell application "Notes"
-            tell (my targetAccount())
-                if not (exists folder folderName) then
-                    error "{_FOLDER_NOT_FOUND_MARKER}"
-                end if
+            tell (my targetAccount()){_FOLDER_MISSING_BRANCH}
                 repeat with n in (notes of folder folderName)
                     set noteId to ""
                     set noteBody to ""
@@ -254,16 +288,34 @@ def _extract_ae_number(stderr: str) -> int | None:
     return int(matches[-1]) if matches else None
 
 
+def _parse_folder_list(stderr: str) -> list[str]:
+    """Extract the FS-joined existing-folder names from a folder-missing error.
+
+    osascript wraps a raised ``error "MARKER" & FS & folderList`` as
+    ``… execution error: MARKER<FS>name1<FS>name2 (-NNNN).`` — the trailing
+    ` (-NNNN).` sits directly after the *last* folder name, so it must be
+    stripped before splitting on FS (the FS control character itself survives
+    to stderr intact; verified on this machine).
+    """
+    payload = stderr.strip()
+    payload = payload[payload.index(_FOLDER_NOT_FOUND_MARKER) :]
+    payload = _TRAILING_AE_CODE_RE.sub("", payload).rstrip()
+    parts = payload.split(_FS)
+    return [name for name in parts[1:] if name]
+
+
 def _classify(stderr: str) -> NotesError:
     if _FOLDER_NOT_FOUND_MARKER in stderr:
-        return FolderNotFoundError()
+        return FolderNotFoundError(existing=_parse_folder_list(stderr))
     number = _extract_ae_number(stderr)
     if number == AE_PERMISSION_DENIED:
         return PermissionDeniedError()
-    if number == AE_NOTES_UNAVAILABLE:
+    if number in (AE_NOTES_UNAVAILABLE, AE_NOTES_CONNECTION_INVALID):
         return NotesUnavailableError()
     if number == AE_TIMEOUT:
         return OperationTimeoutError()
+    if number is None and _AUTOMATION_DENIED_RE.search(stderr):
+        return PermissionDeniedError()
     return NotesError(f"Notes automation failed: {stderr.strip() or 'unknown error'}")
 
 
@@ -301,12 +353,26 @@ class OsascriptNotesProvider:
             raise _classify(proc.stderr)
         return proc.stdout
 
-    def folder_exists(self) -> bool:
-        out = self._run(_FOLDER_EXISTS_SCRIPT, [], _WRITE_KILL_TIMEOUT)
-        return out.strip() == "1"
-
-    def create_note(self, body_html: str) -> None:
-        self._run(_CREATE_SCRIPT, [body_html], _WRITE_KILL_TIMEOUT)
+    def create_note(self, body_html: str) -> str:
+        try:
+            out = self._run(_CREATE_SCRIPT, [body_html], _WRITE_KILL_TIMEOUT)
+        except OperationTimeoutError as exc:
+            # The one create failure that is genuinely ambiguous: a timeout can
+            # fire after `make new note` ran but before the date read-back
+            # returned. Every other failure (folder-missing, permission,
+            # unavailable) is established before any Apple Event that could
+            # have created the note, so it propagates unchanged below.
+            raise AmbiguousCreateError() from exc
+        value = out.strip()
+        if _parse_iso_naive(value) is None:
+            raise NotesError(
+                "Notes did not confirm the new note: neither its creation date nor "
+                "its modification date could be read back, even though the "
+                "operation reported success. The entry may or may not exist; check "
+                "the folder before retrying (the server does not automatically "
+                "retry)."
+            )
+        return value[:10]
 
     def read_notes(self) -> list[RawNote]:
         out = self._run(_READ_SCRIPT, [], _READ_KILL_TIMEOUT)
@@ -363,11 +429,7 @@ class FakeNotesProvider:
         if self._raise_on is not None:
             raise self._raise_on
 
-    def folder_exists(self) -> bool:
-        self._maybe_raise()
-        return self._folder_present
-
-    def create_note(self, body_html: str) -> None:
+    def create_note(self, body_html: str) -> str:
         self._maybe_raise()
         if not self._folder_present:
             raise FolderNotFoundError()
@@ -381,6 +443,10 @@ class FakeNotesProvider:
                 modification_date=now,
             )
         )
+        # Mirrors the real provider's create-then-confirm contract: the date
+        # comes from the stamped note's own creation date, never a separate
+        # server-side clock read.
+        return now.date().isoformat()
 
     def read_notes(self) -> list[RawNote]:
         self._maybe_raise()

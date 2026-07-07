@@ -213,6 +213,8 @@ def consolidate(
     today: date,
     frm: date | None = None,
     to: date | None = None,
+    prefix: str | None = None,
+    include_detail: bool = True,
 ) -> ConsolidatedLog:
     """Filter, sort and render notes into a single chronological text block.
 
@@ -221,6 +223,13 @@ def consolidate(
     ascending by that instant, and rendered as ``YYYY-MM-DD — {first line}``
     with any further body lines unchanged below; entries are separated by a
     single blank line.
+
+    ``prefix``, when non-empty, additionally keeps only entries whose first
+    plain-text line (the ``html_to_text`` output, before the date is
+    prepended) starts with it — an exact, case-sensitive match. ``count``
+    reflects the filtered set. When ``include_detail`` is false, each
+    rendered entry is its dated first line only, with no body lines below;
+    this does not affect which entries are counted.
     """
     effective_to = to if to is not None else today
 
@@ -236,17 +245,26 @@ def consolidate(
         else:
             entry_date = local_date_of(instant, tz)
             sort_key = instant.timestamp()
-        if _in_range(entry_date, frm, effective_to):
-            dated.append((sort_key, entry_date, note.id, note))
+        if not _in_range(entry_date, frm, effective_to):
+            continue
+        if prefix and not html_to_text(note.body_html).split("\n", 1)[0].startswith(prefix):
+            continue
+        dated.append((sort_key, entry_date, note.id, note))
 
     dated.sort(key=lambda item: (item[0], item[2]))
 
-    blocks = [_render_entry(entry_date, note) for _, entry_date, _, note in dated]
+    blocks = [
+        _render_entry(entry_date, note, include_detail=include_detail)
+        for _, entry_date, _, note in dated
+    ]
     return ConsolidatedLog(count=len(blocks), entries_text="\n\n".join(blocks))
 
 
-def _render_entry(entry_date: date, note: RawNote) -> str:
+def _render_entry(entry_date: date, note: RawNote, *, include_detail: bool = True) -> str:
     text = html_to_text(note.body_html)
     lines = text.split("\n") if text else [""]
-    lines[0] = f"{entry_date.isoformat()}{ENTRY_SEPARATOR}{lines[0]}"
+    heading = f"{entry_date.isoformat()}{ENTRY_SEPARATOR}{lines[0]}"
+    if not include_detail:
+        return heading
+    lines[0] = heading
     return "\n".join(lines)

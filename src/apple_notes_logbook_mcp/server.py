@@ -50,7 +50,9 @@ APPEND_TOOL = types.Tool(
     description=(
         f"Append one new note to the Apple Notes '{FOLDER_NAME}' folder (one note = "
         "one entry). 'summary' becomes the note's first line (the heading); optional "
-        "'detail' becomes the body below it. Does not edit existing notes."
+        "'detail' becomes the body below it. Does not edit existing notes. On success, "
+        "returns the new entry's creation date (YYYY-MM-DD), read back from Notes in "
+        "the same operation to confirm the note was actually created."
     ),
     inputSchema={
         "type": "object",
@@ -69,8 +71,16 @@ APPEND_TOOL = types.Tool(
     },
     outputSchema={
         "type": "object",
-        "properties": {"created": {"type": "boolean"}},
-        "required": ["created"],
+        "properties": {
+            "created": {"type": "boolean"},
+            "date": {
+                "type": "string",
+                "description": (
+                    "The new entry's creation date (YYYY-MM-DD), read back from Notes."
+                ),
+            },
+        },
+        "required": ["created", "date"],
         "additionalProperties": False,
     },
     annotations=types.ToolAnnotations(
@@ -88,7 +98,11 @@ READ_TOOL = types.Tool(
         f"Read every note in the '{FOLDER_NAME}' folder and return them consolidated "
         "into one chronological, dated text block. Optional 'from'/'to' (ISO "
         "YYYY-MM-DD) filter inclusively by each note's creation date in your local "
-        "time zone; 'to' defaults to today. Read-only."
+        "time zone; 'to' defaults to today. Optional 'prefix' returns only entries "
+        "whose first line starts with that exact, case-sensitive string (e.g. "
+        "'TECH:'); the server defines no prefix taxonomy of its own. Optional "
+        "'include_detail' (default true) — set false to return dated headings only, "
+        "omitting body lines. Read-only."
     ),
     inputSchema={
         "type": "object",
@@ -100,6 +114,21 @@ READ_TOOL = types.Tool(
             "to": {
                 "type": "string",
                 "description": "Inclusive upper bound, ISO YYYY-MM-DD. Defaults to today.",
+            },
+            "prefix": {
+                "type": "string",
+                "description": (
+                    "Return only entries whose first line starts with this exact, "
+                    "case-sensitive string. Omitted or empty means no filter."
+                ),
+            },
+            "include_detail": {
+                "type": "boolean",
+                "description": (
+                    "When false, return each entry's dated first line only (no body "
+                    "lines). Defaults to true."
+                ),
+                "default": True,
             },
         },
         "additionalProperties": False,
@@ -129,11 +158,13 @@ READ_TOOL = types.Tool(
 def do_append(provider: NotesProvider, arguments: dict[str, Any]) -> dict[str, Any]:
     summary = arguments["summary"]
     detail = arguments.get("detail")
-    if not provider.folder_exists():
-        raise _folder_missing()
     body = core.assemble_body(summary, detail)
-    provider.create_note(body)
-    return {"created": True}
+    # provider.create_note is create-then-confirm: it returns the note's own
+    # creation date (read back from Notes), so a returned "date" only ever
+    # accompanies a persisted entry. Folder-missing surfaces via the in-script
+    # marker (no separate pre-check), same as do_read.
+    entry_date = provider.create_note(body)
+    return {"created": True, "date": entry_date}
 
 
 def _optional_date(arguments: dict[str, Any], key: str) -> date | None:
@@ -148,22 +179,25 @@ def do_read(provider: NotesProvider, arguments: dict[str, Any], *, clock: Clock)
     # Validate dates first so a malformed value is rejected before any read.
     frm = _optional_date(arguments, "from")
     to = _optional_date(arguments, "to")
+    prefix = arguments.get("prefix") or None
+    include_detail = arguments.get("include_detail", True)
 
-    if not provider.folder_exists():
-        raise _folder_missing()
-
+    # Folder-missing surfaces via the in-script marker raised by read_notes()
+    # itself (no separate pre-check): one Apple Event, no TOCTOU window.
     now = clock()
     tz = now.tzinfo
     assert tz is not None  # _default_clock / injected clocks are tz-aware
     notes = provider.read_notes()
-    result = core.consolidate(notes, tz=tz, today=now.date(), frm=frm, to=to)
+    result = core.consolidate(
+        notes,
+        tz=tz,
+        today=now.date(),
+        frm=frm,
+        to=to,
+        prefix=prefix,
+        include_detail=include_detail,
+    )
     return {"count": result.count, "entries_text": result.entries_text}
-
-
-def _folder_missing() -> Exception:
-    from .notes import FolderNotFoundError
-
-    return FolderNotFoundError(FOLDER_NAME)
 
 
 # ---------------------------------------------------------------------------
