@@ -107,3 +107,16 @@ change observable behavior, update the spec** — code and spec are expected to 
 
 `Tool-Knowledge.md` is the "hard-won facts" file for real-machine Apple Notes behavior;
 update it whenever observed behavior contradicts an assumption there.
+
+## Commit conventions
+
+- **No Claude/Anthropic references.** Commit messages never mention Claude or Anthropic and
+  never include a `Co-Authored-By: Claude` (or similar) trailer, regardless of what tooling
+  produced the change.
+- **Body as bullet points, not prose.** For any commit touching more than one thing, write the
+  body as a short bullet list — one change per line — not a paragraph; it stays scannable in
+  `git log`. Reserve prose for genuinely single-point commits.
+- **Subject line:** short, imperative, describes the net effect (e.g. "Harden append/read
+  confirmation and add read_log projection filters"), not a change-proposal name or task ID.
+- **New commits over amends.** Prefer a new commit over `git commit --amend`; only amend when
+  explicitly asked to.
